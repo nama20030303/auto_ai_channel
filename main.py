@@ -1,14 +1,15 @@
 import asyncio
 import os
+import re
 import requests
-import feedparser
 from bs4 import BeautifulSoup
 from openai import AsyncOpenAI
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import aiosqlite
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 import uvicorn
-from telegram import Bot
+from telegram import Update, Bot
+from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
 
 # ================== ПЕРЕМЕННЫЕ ==================
 
@@ -16,15 +17,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-RSS_FEEDS = [
-    "https://lenta.ru/rss",
-    "https://ria.ru/export/rss2/archive/index.xml"
-]
-
 POST_INTERVAL = 30  # минут
 
-bot = Bot(token=BOT_TOKEN)
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+bot = Bot(token=BOT_TOKEN)
 app = FastAPI()
 DB = "posts.db"
 
@@ -33,32 +29,31 @@ DB = "posts.db"
 async def init_db():
     async with aiosqlite.connect(DB) as db:
         await db.execute("""
-        CREATE TABLE IF NOT EXISTS posts (
+        CREATE TABLE IF NOT EXISTS queue (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            text TEXT,
-            image TEXT,
+            url TEXT,
             published INTEGER DEFAULT 0
         )
         """)
         await db.commit()
 
-async def add_post(text, image):
+async def add_url(url):
     async with aiosqlite.connect(DB) as db:
         await db.execute(
-            "INSERT INTO posts (text, image) VALUES (?, ?)",
-            (text, image)
+            "INSERT INTO queue (url) VALUES (?)",
+            (url,)
         )
         await db.commit()
 
-async def get_next_post():
+async def get_next_url():
     async with aiosqlite.connect(DB) as db:
         async with db.execute(
-            "SELECT id, text, image FROM posts WHERE published=0 LIMIT 1"
+            "SELECT id, url FROM queue WHERE published=0 LIMIT 1"
         ) as cursor:
             row = await cursor.fetchone()
             if row:
                 await db.execute(
-                    "UPDATE posts SET published=1 WHERE id=?",
+                    "UPDATE queue SET published=1 WHERE id=?",
                     (row[0],)
                 )
                 await db.commit()
@@ -100,30 +95,44 @@ async def generate_post(text):
 
     return response.choices[0].message.content
 
-# ================== RSS ==================
-
-async def collect_news():
-    for feed_url in RSS_FEEDS:
-        feed = feedparser.parse(feed_url)
-        for entry in feed.entries[:3]:
-            text, image = parse_article(entry.link)
-            if text:
-                post = await generate_post(text)
-                await add_post(post, image)
-
 # ================== ПУБЛИКАЦИЯ ==================
 
 async def publish():
-    post = await get_next_post()
-    if post:
-        _, text, image = post
-        try:
-            if image:
-                await bot.send_photo(chat_id=CHANNEL_ID, photo=image, caption=text)
-            else:
-                await bot.send_message(chat_id=CHANNEL_ID, text=text)
-        except Exception as e:
-            print("Ошибка публикации:", e)
+    row = await get_next_url()
+    if not row:
+        return
+
+    _, url = row
+    text, image = parse_article(url)
+
+    if not text:
+        return
+
+    post = await generate_post(text)
+
+    try:
+        if image:
+            await bot.send_photo(chat_id=CHANNEL_ID, photo=image, caption=post)
+        else:
+            await bot.send_message(chat_id=CHANNEL_ID, text=post)
+    except Exception as e:
+        print("Ошибка публикации:", e)
+
+# ================== TELEGRAM ОБРАБОТКА ==================
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+
+    urls = re.findall(r'(https?://\S+)', text)
+
+    if not urls:
+        await update.message.reply_text("Пришли ссылку на статью.")
+        return
+
+    for url in urls:
+        await add_url(url)
+
+    await update.message.reply_text(f"✅ Добавлено ссылок: {len(urls)}")
 
 # ================== FASTAPI ==================
 
@@ -137,12 +146,19 @@ async def start_scheduler():
     await init_db()
 
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(collect_news, "interval", hours=2)
     scheduler.add_job(publish, "interval", minutes=POST_INTERVAL)
     scheduler.start()
 
+async def start_telegram():
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()
+
 async def main():
     asyncio.create_task(start_scheduler())
+    asyncio.create_task(start_telegram())
 
     port = int(os.environ.get("PORT", 10000))
     config = uvicorn.Config(app, host="0.0.0.0", port=port)
