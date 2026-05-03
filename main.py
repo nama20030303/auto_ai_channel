@@ -34,15 +34,32 @@ DISCLAIMER = "\n\n⚠️ Материал носит информационны�
 
 def parse_article(url):
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0"
-        }
+        headers = {"User-Agent": "Mozilla/5.0"}
+
         r = requests.get(url, headers=headers, timeout=15)
         r.raise_for_status()
 
         soup = BeautifulSoup(r.text, "html.parser")
-        paragraphs = soup.find_all("p")
 
+        # ✅ 1. og:image (главное изображение)
+        image = None
+        og_image = soup.find("meta", property="og:image")
+        if og_image and og_image.get("content"):
+            image = og_image["content"]
+
+        # ✅ 2. fallback — первая картинка
+        if not image:
+            img_tag = soup.find("img")
+            if img_tag and img_tag.get("src"):
+                image = img_tag["src"]
+
+        # ✅ делаем ссылку абсолютной если нужно
+        if image and image.startswith("/"):
+            from urllib.parse import urljoin
+            image = urljoin(url, image)
+
+        # ✅ текст
+        paragraphs = soup.find_all("p")
         text = "\n".join(
             p.get_text().strip()
             for p in paragraphs
@@ -53,13 +70,13 @@ def parse_article(url):
             text = soup.get_text(separator="\n")
 
         if len(text) < 200:
-            return None
+            return None, None
 
-        return text[:4000]
+        return text[:5000], image
 
     except Exception as e:
         print("PARSE ERROR:", e)
-        return None
+        return None, None
 
 # ================= YANDEX GPT =================
 
@@ -98,7 +115,7 @@ def generate_post(text):
     }
 
     try:
-        response = requests.post(url, headers=headers, json=data)
+        response = requests.post(url, headers=headers, json=data, timeout=30)
         response.raise_for_status()
 
         result = response.json()
@@ -121,16 +138,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Ссылка не найдена.")
         return
 
-    await update.message.reply_text("⏳ Генерирую пост через YandexGPT...")
+    await update.message.reply_text("⏳ Генерирую пост...")
 
-    article_text = parse_article(urls[0])
+    article_text, image_url = parse_article(urls[0])
+
     if not article_text:
         await update.message.reply_text("❌ Не удалось прочитать статью.")
         return
 
     post = generate_post(article_text)
 
-    preview_storage[ADMIN_ID] = {"post": post}
+    preview_storage[ADMIN_ID] = {
+        "post": post,
+        "image": image_url
+    }
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Опубликовать", callback_data="approve")]
@@ -146,10 +167,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not data:
         return
 
-    await context.bot.send_message(
-        chat_id=CHANNEL_ID,
-        text=data["post"]
-    )
+    if data["image"]:
+        await context.bot.send_photo(
+            chat_id=CHANNEL_ID,
+            photo=data["image"],
+            caption=data["post"]
+        )
+    else:
+        await context.bot.send_message(
+            chat_id=CHANNEL_ID,
+            text=data["post"]
+        )
 
     preview_storage.pop(ADMIN_ID)
     await query.edit_message_text("✅ Опубликовано")
@@ -178,6 +206,8 @@ async def health():
 async def startup():
     await telegram_app.initialize()
     await telegram_app.bot.set_webhook(WEBHOOK_URL)
+
+# ================= MAIN =================
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
