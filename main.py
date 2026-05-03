@@ -36,11 +36,7 @@ DISCLAIMER = "\n\n⚠️ Материал носит информационны�
 def parse_article(url):
     try:
         headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120 Safari/537.36"
-            )
+            "User-Agent": "Mozilla/5.0"
         }
 
         r = requests.get(url, headers=headers, timeout=20)
@@ -48,38 +44,18 @@ def parse_article(url):
 
         soup = BeautifulSoup(r.text, "html.parser")
 
-        # ========= IMAGE SEARCH =========
-
+        # ===== IMAGE SEARCH =====
         image = None
 
-        # 1️⃣ og:image
         og = soup.find("meta", property="og:image")
         if og and og.get("content"):
             image = og["content"]
 
-        # 2️⃣ twitter:image
         if not image:
             tw = soup.find("meta", property="twitter:image")
             if tw and tw.get("content"):
                 image = tw["content"]
 
-        # 3️⃣ article image
-        if not image:
-            article = soup.find("article")
-            if article:
-                img = article.find("img")
-                if img and img.get("src"):
-                    image = img["src"]
-
-        # 4️⃣ figure img
-        if not image:
-            figure = soup.find("figure")
-            if figure:
-                img = figure.find("img")
-                if img and img.get("src"):
-                    image = img["src"]
-
-        # 5️⃣ fallback — первая нормальная картинка
         if not image:
             for img in soup.find_all("img"):
                 src = img.get("src")
@@ -87,43 +63,23 @@ def parse_article(url):
                     image = src
                     break
 
-        # абсолютная ссылка
         if image:
             image = urljoin(url, image)
 
-        # ========= TEXT SEARCH =========
-
-        text_blocks = []
-
-        # 1️⃣ article tag
-        article = soup.find("article")
-        if article:
-            text_blocks = article.find_all("p")
-
-        # 2️⃣ main content fallback
-        if not text_blocks:
-            main = soup.find("main")
-            if main:
-                text_blocks = main.find_all("p")
-
-        # 3️⃣ general paragraphs
-        if not text_blocks:
-            text_blocks = soup.find_all("p")
-
+        # ===== TEXT SEARCH =====
+        paragraphs = soup.find_all("p")
         text = "\n".join(
             p.get_text().strip()
-            for p in text_blocks
+            for p in paragraphs
             if len(p.get_text().strip()) > 50
         )
 
-        # 4️⃣ full page fallback
         if len(text) < 300:
             text = soup.get_text(separator="\n")
 
         text = text.strip()
 
         if len(text) < 300:
-            print("PARSE ERROR: Not enough text")
             return None, None
 
         return text[:6000], image
@@ -145,14 +101,29 @@ def generate_post(text):
     prompt = f"""
 Ты анонимный экспертный Telegram-канал о спортивных добавках.
 
-Сделай научный разбор:
-- что изучали
-- результаты
-- вывод
+Сделай красивый структурированный пост в формате:
 
-Добавь 3-5 релевантных хештегов.
+🔬 Заголовок
 
-Текст:
+Здравствуйте, дорогие читатели!
+
+Краткое объяснение вещества или исследования.
+
+📊 Результаты (если есть цифры — добавляй проценты и числа).
+
+💊 Механизм действия или ключевые особенности.
+
+🚫 Предостережение (без медицинских обещаний).
+
+✅ Возможный формат применения (нейтрально).
+
+📍 Рекомендация проконсультироваться со специалистом.
+
+В конце:
+— 4-6 хештегов
+— короткий призыв подписаться
+
+Текст статьи:
 {text}
 """
 
@@ -160,8 +131,8 @@ def generate_post(text):
         "modelUri": f"gpt://{YANDEX_FOLDER_ID}/yandexgpt-lite/latest",
         "completionOptions": {
             "stream": False,
-            "temperature": 0.7,
-            "maxTokens": 1500
+            "temperature": 0.8,
+            "maxTokens": 1800
         },
         "messages": [
             {"role": "user", "text": prompt}
@@ -171,10 +142,8 @@ def generate_post(text):
     try:
         response = requests.post(url, headers=headers, json=data, timeout=30)
         response.raise_for_status()
-
         result = response.json()
         return result["result"]["alternatives"][0]["message"]["text"] + DISCLAIMER
-
     except Exception as e:
         print("YANDEX ERROR:", e)
         return "❌ Ошибка генерации текста."
@@ -221,12 +190,28 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not data:
         return
 
+    # ✅ Скачиваем картинку сами
     if data["image"]:
-        await context.bot.send_photo(
-            chat_id=CHANNEL_ID,
-            photo=data["image"],
-            caption=data["post"]
-        )
+        try:
+            headers = {"User-Agent": "Mozilla/5.0"}
+            img_response = requests.get(data["image"], headers=headers, timeout=15)
+
+            if img_response.status_code == 200:
+                await context.bot.send_photo(
+                    chat_id=CHANNEL_ID,
+                    photo=img_response.content,
+                    caption=data["post"]
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=CHANNEL_ID,
+                    text=data["post"]
+                )
+        except:
+            await context.bot.send_message(
+                chat_id=CHANNEL_ID,
+                text=data["post"]
+            )
     else:
         await context.bot.send_message(
             chat_id=CHANNEL_ID,
