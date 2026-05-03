@@ -6,3 +6,5 @@ requests
 apscheduler
 aiosqlite
 python-dotenv
+fastapi
+uvicorn
