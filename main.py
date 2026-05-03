@@ -4,11 +4,11 @@ import requests
 import feedparser
 from bs4 import BeautifulSoup
 from openai import AsyncOpenAI
-from aiogram import Bot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import aiosqlite
 from fastapi import FastAPI
 import uvicorn
+from telegram import Bot
 
 # ================== ПЕРЕМЕННЫЕ ==================
 
@@ -23,12 +23,9 @@ RSS_FEEDS = [
 
 POST_INTERVAL = 30  # минут
 
-# ================== ИНИЦИАЛИЗАЦИЯ ==================
-
 bot = Bot(token=BOT_TOKEN)
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 app = FastAPI()
-
 DB = "posts.db"
 
 # ================== БАЗА ==================
@@ -89,7 +86,6 @@ async def generate_post(text):
     Сделай короткий интересный Telegram-пост.
     До 1200 символов.
     Добавь эмодзи.
-    Стиль — живой и вовлекающий.
     В конце задай вопрос.
 
     Текст:
@@ -109,7 +105,6 @@ async def generate_post(text):
 async def collect_news():
     for feed_url in RSS_FEEDS:
         feed = feedparser.parse(feed_url)
-
         for entry in feed.entries[:3]:
             text, image = parse_article(entry.link)
             if text:
@@ -124,9 +119,9 @@ async def publish():
         _, text, image = post
         try:
             if image:
-                await bot.send_photo(CHANNEL_ID, image, caption=text)
+                await bot.send_photo(chat_id=CHANNEL_ID, photo=image, caption=text)
             else:
-                await bot.send_message(CHANNEL_ID, text)
+                await bot.send_message(chat_id=CHANNEL_ID, text=text)
         except Exception as e:
             print("Ошибка публикации:", e)
 
@@ -134,11 +129,11 @@ async def publish():
 
 @app.get("/")
 def home():
-    return {"status": "Bot is running ✅"}
+    return {"status": "Bot running ✅"}
 
 # ================== ЗАПУСК ==================
 
-async def start_bot():
+async def start_scheduler():
     await init_db()
 
     scheduler = AsyncIOScheduler()
@@ -146,10 +141,8 @@ async def start_bot():
     scheduler.add_job(publish, "interval", minutes=POST_INTERVAL)
     scheduler.start()
 
-    print("Бот полностью автономен ✅")
-
 async def main():
-    asyncio.create_task(start_bot())
+    asyncio.create_task(start_scheduler())
 
     port = int(os.environ.get("PORT", 10000))
     config = uvicorn.Config(app, host="0.0.0.0", port=port)
