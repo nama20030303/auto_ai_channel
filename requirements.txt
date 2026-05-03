@@ -1,0 +1,8 @@
+aiogram==3.4.1
+openai
+feedparser
+beautifulsoup4
+requests
+apscheduler
+aiosqlite
+python-dotenv
