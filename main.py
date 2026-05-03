@@ -6,14 +6,10 @@ import base64
 import requests
 import feedparser
 import aiosqlite
-
 from bs4 import BeautifulSoup
 from openai import AsyncOpenAI
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import FastAPI
-import uvicorn
-
-from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     MessageHandler,
@@ -30,15 +26,10 @@ CHANNEL_ID = os.getenv("CHANNEL_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
-BASE_POST_TIMES = ["12:00", "18:00"]
 PUBMED_RSS = "https://pubmed.ncbi.nlm.nih.gov/rss/search/1R5oYJkXyZgKkZsXx0H8/?limit=10"
 
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-bot = Bot(token=BOT_TOKEN)
-
-app = FastAPI()
 scheduler = AsyncIOScheduler()
-
 DB = "posts.db"
 preview_storage = {}
 DISCLAIMER = "\n\n⚠️ Материал носит информационный характер."
@@ -48,30 +39,12 @@ DISCLAIMER = "\n\n⚠️ Материал носит информационны�
 async def init_db():
     async with aiosqlite.connect(DB) as db:
         await db.execute("""
-        CREATE TABLE IF NOT EXISTS queue (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            url TEXT,
-            published INTEGER DEFAULT 0
-        )
-        """)
-        await db.execute("""
         CREATE TABLE IF NOT EXISTS posts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             message_id INTEGER,
-            views INTEGER DEFAULT 0,
-            published_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            views INTEGER DEFAULT 0
         )
         """)
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            id INTEGER PRIMARY KEY,
-            promo_enabled INTEGER DEFAULT 0,
-            promo_brand TEXT,
-            promo_link TEXT,
-            promo_ratio INTEGER DEFAULT 5
-        )
-        """)
-        await db.execute("INSERT OR IGNORE INTO settings (id) VALUES (1)")
         await db.commit()
 
 # ================= PARSING =================
@@ -91,50 +64,20 @@ def get_pubmed_article():
         return None
     return feed.entries[0].link
 
-# ================= PROMO =================
-
-async def get_promo():
-    async with aiosqlite.connect(DB) as db:
-        async with db.execute("SELECT promo_enabled, promo_brand, promo_link, promo_ratio FROM settings WHERE id=1") as cur:
-            return await cur.fetchone()
-
-async def set_promo(enabled, brand=None, link=None):
-    async with aiosqlite.connect(DB) as db:
-        await db.execute("""
-        UPDATE settings
-        SET promo_enabled=?, promo_brand=?, promo_link=?
-        WHERE id=1
-        """, (enabled, brand, link))
-        await db.commit()
-
 # ================= AI =================
 
 async def generate_post(text):
-    promo_enabled, brand, link, ratio = await get_promo()
-    is_promo = promo_enabled and random.randint(1, ratio) == 1
-
-    if is_promo:
-        prompt = f"""
-Сделай научный разбор исследования.
-В конце мягко упомяни бренд {brand} и добавь ссылку {link}.
-Добавь 3-5 хештегов.
-Текст:
-{text}
-"""
-    else:
-        prompt = f"""
+    prompt = f"""
 Сделай научный разбор исследования.
 Добавь 3-5 хештегов.
 Текст:
 {text}
 """
-
     response = await client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.7,
     )
-
     return response.choices[0].message.content + DISCLAIMER
 
 async def generate_cover(title):
@@ -145,38 +88,13 @@ async def generate_cover(title):
     )
     return base64.b64decode(img.data[0].b64_json)
 
-# ================= STATS =================
+# ================= AUTO PUBLISH =================
 
-async def save_post(message_id):
-    async with aiosqlite.connect(DB) as db:
-        await db.execute("INSERT INTO posts (message_id) VALUES (?)", (message_id,))
-        await db.commit()
+async def auto_publish(application):
+    url = get_pubmed_article()
+    if not url:
+        return
 
-async def get_avg_views():
-    async with aiosqlite.connect(DB) as db:
-        async with db.execute("SELECT AVG(views) FROM posts ORDER BY id DESC LIMIT 5") as cur:
-            row = await cur.fetchone()
-            return row[0] or 0
-
-# ================= SMART SCHEDULE =================
-
-async def adjust_schedule():
-    avg = await get_avg_views()
-    scheduler.remove_all_jobs()
-
-    times = BASE_POST_TIMES.copy()
-    if avg > 1500:
-        times.append("22:00")
-    if avg > 3000:
-        times = ["10:00", "14:00", "18:00"]
-
-    for t in times:
-        hour, minute = map(int, t.split(":"))
-        scheduler.add_job(auto_publish, "cron", hour=hour, minute=minute)
-
-# ================= PUBLISH =================
-
-async def publish_from_url(url):
     text = parse_article(url)
     if not text:
         return
@@ -184,13 +102,11 @@ async def publish_from_url(url):
     post = await generate_post(text)
     cover = await generate_cover(post[:80])
 
-    msg = await bot.send_photo(CHANNEL_ID, cover, caption=post)
-    await save_post(msg.message_id)
-
-async def auto_publish():
-    url = get_pubmed_article()
-    if url:
-        await publish_from_url(url)
+    await application.bot.send_photo(
+        chat_id=CHANNEL_ID,
+        photo=cover,
+        caption=post
+    )
 
 # ================= TELEGRAM =================
 
@@ -203,9 +119,6 @@ def admin_only(func):
 
 @admin_only
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-
     text = update.message.text or ""
     urls = re.findall(r'https?://[^\s]+', text)
 
@@ -213,20 +126,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Ссылка не найдена.")
         return
 
-    url = urls[0]
     await update.message.reply_text("⏳ Генерирую пост...")
 
-    article_text = parse_article(url)
+    article_text = parse_article(urls[0])
     if not article_text:
         await update.message.reply_text("❌ Не удалось прочитать статью.")
         return
 
     post = await generate_post(article_text)
-    preview_storage[ADMIN_ID] = {"url": url}
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Опубликовать", callback_data="approve")]
     ])
+
+    preview_storage[ADMIN_ID] = {"url": urls[0], "post": post}
 
     await update.message.reply_text(post, reply_markup=keyboard)
 
@@ -238,43 +151,39 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not data:
         return
 
-    await publish_from_url(data["url"])
+    cover = await generate_cover(data["post"][:80])
+
+    await context.bot.send_photo(
+        chat_id=CHANNEL_ID,
+        photo=cover,
+        caption=data["post"]
+    )
+
     preview_storage.pop(ADMIN_ID)
     await query.edit_message_text("✅ Опубликовано")
 
-@admin_only
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    avg = await get_avg_views()
-    await update.message.reply_text(f"📊 Средние просмотры: {int(avg)}")
-
-# ================= FASTAPI =================
-
-@app.get("/")
-def home():
-    return {"status": "Bot running ✅"}
-
 # ================= MAIN =================
 
-def main():
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(init_db())
-
-    loop.run_until_complete(adjust_schedule())
+async def post_init(application):
+    await init_db()
+    scheduler.add_job(auto_publish, "cron", hour=12, minute=0, args=[application])
+    scheduler.add_job(auto_publish, "cron", hour=18, minute=0, args=[application])
     scheduler.start()
 
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
+def main():
+    application = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(button_handler))
-    application.add_handler(CommandHandler("stats", stats_command))
 
+    # ✅ ВАЖНО: встроенный webserver для Render
     port = int(os.environ.get("PORT", 10000))
-    config = uvicorn.Config(app, host="0.0.0.0", port=port)
-    server = uvicorn.Server(config)
-
-    loop.create_task(server.serve())
-
-    application.run_polling()
+    application.run_polling(stop_signals=None)
 
 if __name__ == "__main__":
     main()
