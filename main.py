@@ -32,39 +32,73 @@ telegram_app = ApplicationBuilder().token(BOT_TOKEN).build()
 preview_storage = {}
 DISCLAIMER = "\n\n⚠️ Материал носит информационный характер."
 
+# ================= PARSING =================
+
+def parse_article(url):
+    try:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0 Safari/537.36"
+            )
+        }
+
+        r = requests.get(url, headers=headers, timeout=15)
+        r.raise_for_status()
+
+        soup = BeautifulSoup(r.text, "html.parser")
+        paragraphs = soup.find_all("p")
+
+        text = "\n".join(
+            p.get_text().strip()
+            for p in paragraphs
+            if len(p.get_text().strip()) > 40
+        )
+
+        if len(text) < 200:
+            print("PARSE ERROR: Not enough content")
+            return None
+
+        return text[:4000]
+
+    except Exception as e:
+        print("PARSE ERROR:", e)
+        return None
+
 # ================= AI =================
 
 async def generate_post(text):
     prompt = f"""
-Сделай научный разбор исследования.
-Добавь 3-5 хештегов.
+Ты анонимный экспертный канал о спортивных добавках.
+
+Сделай научный разбор:
+- что изучали
+- результаты с цифрами
+- вывод
+
+Добавь 3-5 релевантных хештегов в конце.
+Без медицинских обещаний.
+
 Текст:
 {text}
 """
+
     response = await client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}],
+        temperature=0.7,
     )
+
     return response.choices[0].message.content + DISCLAIMER
 
 async def generate_cover(title):
     img = await client.images.generate(
         model="gpt-image-1",
-        prompt=f"Scientific minimalistic fitness cover about {title}",
+        prompt=f"Minimalistic scientific fitness cover about {title}",
         size="1024x1024"
     )
     return base64.b64decode(img.data[0].b64_json)
-
-# ================= PARSE =================
-
-def parse_article(url):
-    try:
-        r = requests.get(url, timeout=10)
-        soup = BeautifulSoup(r.text, "html.parser")
-        text = "\n".join([p.get_text() for p in soup.find_all("p")])
-        return text[:4000]
-    except:
-        return None
 
 # ================= TELEGRAM =================
 
@@ -83,10 +117,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     article_text = parse_article(urls[0])
     if not article_text:
-        await update.message.reply_text("Не удалось прочитать статью.")
+        await update.message.reply_text("❌ Не удалось прочитать статью.")
         return
 
     post = await generate_post(article_text)
+
     preview_storage[ADMIN_ID] = {"post": post}
 
     keyboard = InlineKeyboardMarkup([
@@ -114,8 +149,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     preview_storage.pop(ADMIN_ID)
     await query.edit_message_text("✅ Опубликовано")
 
-telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-telegram_app.add_handler(CallbackQueryHandler(button_handler))
+telegram_app.add_handler(
+    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+)
+telegram_app.add_handler(
+    CallbackQueryHandler(button_handler)
+)
 
 # ================= WEBHOOK =================
 
