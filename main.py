@@ -2,6 +2,7 @@ import os
 import re
 import requests
 from bs4 import BeautifulSoup
+from urllib.parse import urljoin
 from fastapi import FastAPI, Request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -30,49 +31,102 @@ telegram_app = ApplicationBuilder().token(BOT_TOKEN).build()
 preview_storage = {}
 DISCLAIMER = "\n\n⚠️ Материал носит информационный характер."
 
-# ================= PARSING =================
+# ================= UNIVERSAL PARSER =================
 
 def parse_article(url):
     try:
-        headers = {"User-Agent": "Mozilla/5.0"}
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120 Safari/537.36"
+            )
+        }
 
-        r = requests.get(url, headers=headers, timeout=15)
+        r = requests.get(url, headers=headers, timeout=20)
         r.raise_for_status()
 
         soup = BeautifulSoup(r.text, "html.parser")
 
-        # ✅ 1. og:image (главное изображение)
+        # ========= IMAGE SEARCH =========
+
         image = None
-        og_image = soup.find("meta", property="og:image")
-        if og_image and og_image.get("content"):
-            image = og_image["content"]
 
-        # ✅ 2. fallback — первая картинка
+        # 1️⃣ og:image
+        og = soup.find("meta", property="og:image")
+        if og and og.get("content"):
+            image = og["content"]
+
+        # 2️⃣ twitter:image
         if not image:
-            img_tag = soup.find("img")
-            if img_tag and img_tag.get("src"):
-                image = img_tag["src"]
+            tw = soup.find("meta", property="twitter:image")
+            if tw and tw.get("content"):
+                image = tw["content"]
 
-        # ✅ делаем ссылку абсолютной если нужно
-        if image and image.startswith("/"):
-            from urllib.parse import urljoin
+        # 3️⃣ article image
+        if not image:
+            article = soup.find("article")
+            if article:
+                img = article.find("img")
+                if img and img.get("src"):
+                    image = img["src"]
+
+        # 4️⃣ figure img
+        if not image:
+            figure = soup.find("figure")
+            if figure:
+                img = figure.find("img")
+                if img and img.get("src"):
+                    image = img["src"]
+
+        # 5️⃣ fallback — первая нормальная картинка
+        if not image:
+            for img in soup.find_all("img"):
+                src = img.get("src")
+                if src and len(src) > 20 and not src.endswith(".svg"):
+                    image = src
+                    break
+
+        # абсолютная ссылка
+        if image:
             image = urljoin(url, image)
 
-        # ✅ текст
-        paragraphs = soup.find_all("p")
+        # ========= TEXT SEARCH =========
+
+        text_blocks = []
+
+        # 1️⃣ article tag
+        article = soup.find("article")
+        if article:
+            text_blocks = article.find_all("p")
+
+        # 2️⃣ main content fallback
+        if not text_blocks:
+            main = soup.find("main")
+            if main:
+                text_blocks = main.find_all("p")
+
+        # 3️⃣ general paragraphs
+        if not text_blocks:
+            text_blocks = soup.find_all("p")
+
         text = "\n".join(
             p.get_text().strip()
-            for p in paragraphs
-            if len(p.get_text().strip()) > 40
+            for p in text_blocks
+            if len(p.get_text().strip()) > 50
         )
 
-        if len(text) < 200:
+        # 4️⃣ full page fallback
+        if len(text) < 300:
             text = soup.get_text(separator="\n")
 
-        if len(text) < 200:
+        text = text.strip()
+
+        if len(text) < 300:
+            print("PARSE ERROR: Not enough text")
             return None, None
 
-        return text[:5000], image
+        return text[:6000], image
 
     except Exception as e:
         print("PARSE ERROR:", e)
@@ -89,14 +143,14 @@ def generate_post(text):
     }
 
     prompt = f"""
-Ты анонимный экспертный канал о спортивных добавках.
+Ты анонимный экспертный Telegram-канал о спортивных добавках.
 
 Сделай научный разбор:
 - что изучали
 - результаты
 - вывод
 
-Добавь 3-5 хештегов.
+Добавь 3-5 релевантных хештегов.
 
 Текст:
 {text}
@@ -123,7 +177,7 @@ def generate_post(text):
 
     except Exception as e:
         print("YANDEX ERROR:", e)
-        return "❌ Ошибка генерации текста. Проверь IAM токен."
+        return "❌ Ошибка генерации текста."
 
 # ================= TELEGRAM =================
 
@@ -138,7 +192,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Ссылка не найдена.")
         return
 
-    await update.message.reply_text("⏳ Генерирую пост...")
+    await update.message.reply_text("⏳ Анализирую статью...")
 
     article_text, image_url = parse_article(urls[0])
 
