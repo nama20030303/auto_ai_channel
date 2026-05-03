@@ -48,19 +48,32 @@ def parse_article(url):
         r.raise_for_status()
 
         soup = BeautifulSoup(r.text, "html.parser")
-        paragraphs = soup.find_all("p")
 
+        # 1️⃣ Обычные параграфы
+        paragraphs = soup.find_all("p")
         text = "\n".join(
             p.get_text().strip()
             for p in paragraphs
             if len(p.get_text().strip()) > 40
         )
 
+        # 2️⃣ PubMed abstract
         if len(text) < 200:
-            print("PARSE ERROR: Not enough content")
+            abstract = soup.find("div", class_="abstract-content")
+            if abstract:
+                text = abstract.get_text(separator="\n").strip()
+
+        # 3️⃣ Если мало текста — берём весь текст страницы
+        if len(text) < 200:
+            text = soup.get_text(separator="\n")
+
+        text = text.strip()
+
+        if len(text) < 200:
+            print("PARSE ERROR: Still not enough content")
             return None
 
-        return text[:4000]
+        return text[:5000]
 
     except Exception as e:
         print("PARSE ERROR:", e)
@@ -121,7 +134,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     post = await generate_post(article_text)
-
     preview_storage[ADMIN_ID] = {"post": post}
 
     keyboard = InlineKeyboardMarkup([
