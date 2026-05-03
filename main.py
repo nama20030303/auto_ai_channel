@@ -1,9 +1,7 @@
 import os
 import re
-import asyncio
 import base64
 import requests
-import feedparser
 from bs4 import BeautifulSoup
 from openai import AsyncOpenAI
 from fastapi import FastAPI, Request
@@ -15,15 +13,20 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+import uvicorn
+
+# ================= CONFIG =================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
-client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-app = FastAPI()
+WEBHOOK_URL = "https://auto-ai-channel.onrender.com/webhook"
 
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+app = FastAPI()
 telegram_app = ApplicationBuilder().token(BOT_TOKEN).build()
 
 preview_storage = {}
@@ -84,7 +87,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     post = await generate_post(article_text)
-    preview_storage[ADMIN_ID] = {"url": urls[0], "post": post}
+    preview_storage[ADMIN_ID] = {"post": post}
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Опубликовать", callback_data="approve")]
@@ -124,7 +127,7 @@ async def webhook(req: Request):
     return {"ok": True}
 
 @app.get("/")
-def health():
+async def health():
     return {"status": "running"}
 
 # ================= STARTUP =================
@@ -132,6 +135,10 @@ def health():
 @app.on_event("startup")
 async def startup():
     await telegram_app.initialize()
-    await telegram_app.bot.set_webhook(
-        url=f"https://auto-ai-channel.onrender.com/webhook"
-    )
+    await telegram_app.bot.set_webhook(WEBHOOK_URL)
+
+# ================= MAIN =================
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
