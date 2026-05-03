@@ -29,7 +29,6 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
 BASE_POST_TIMES = ["12:00", "18:00"]
-
 PUBMED_RSS = "https://pubmed.ncbi.nlm.nih.gov/rss/search/1R5oYJkXyZgKkZsXx0H8/?limit=10"
 
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
@@ -39,7 +38,6 @@ scheduler = AsyncIOScheduler()
 DB = "posts.db"
 
 preview_storage = {}
-
 DISCLAIMER = "\n\n⚠️ Материал носит информационный характер."
 
 # ================= DATABASE =================
@@ -170,7 +168,7 @@ async def save_post(message_id):
 
 async def update_views():
     async with aiosqlite.connect(DB) as db:
-        async with db.execute("SELECT id, message_id FROM posts ORDER BY id DESC LIMIT 10") as cur:
+        async with db.execute("SELECT id, message_id FROM posts ORDER BY id DESC LIMIT 5") as cur:
             rows = await cur.fetchall()
             for post_id, msg_id in rows:
                 try:
@@ -191,13 +189,11 @@ async def get_avg_views():
             row = await cur.fetchone()
             return row[0] or 0
 
-# ================= SMART FREQUENCY =================
+# ================= SMART SCHEDULE =================
 
 async def adjust_schedule():
     avg = await get_avg_views()
-
     scheduler.remove_all_jobs()
-
     times = BASE_POST_TIMES.copy()
 
     if avg > 1500:
@@ -247,16 +243,33 @@ def admin_only(func):
 
 @admin_only
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    urls = re.findall(r'(https?://\S+)', update.message.text)
+    if not update.message:
+        return
+
+    text = update.message.text or ""
+    urls = []
+
+    if update.message.entities:
+        for entity in update.message.entities:
+            if entity.type == "url":
+                urls.append(text[entity.offset: entity.offset + entity.length])
+
     if not urls:
+        urls = re.findall(r'https?://[^\s]+', text)
+
+    if not urls:
+        await update.message.reply_text("Ссылка не найдена.")
         return
 
     url = urls[0]
-    text = parse_article(url)
-    if not text:
+    await update.message.reply_text("⏳ Генерирую пост...")
+
+    article_text = parse_article(url)
+    if not article_text:
+        await update.message.reply_text("❌ Не удалось прочитать статью.")
         return
 
-    post = await generate_post(text)
+    post = await generate_post(article_text)
     preview_storage[ADMIN_ID] = {"url": url, "post": post}
 
     keyboard = InlineKeyboardMarkup([
@@ -329,7 +342,7 @@ async def start_telegram():
 
     await application.initialize()
     await application.start()
-    await application.updater.start_polling()
+    await application.run_polling()
 
 async def main():
     asyncio.create_task(start_scheduler())
