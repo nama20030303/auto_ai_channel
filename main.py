@@ -345,13 +345,30 @@ async def start_telegram():
     await application.run_polling()
 
 async def main():
-    asyncio.create_task(start_scheduler())
-    asyncio.create_task(start_telegram())
+    await init_db()
 
+    # Запускаем планировщик
+    await adjust_schedule()
+    scheduler.start()
+
+    # Настройка Telegram
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("promo_on", promo_on))
+    application.add_handler(CommandHandler("promo_off", promo_off))
+
+    # Запускаем FastAPI в фоне
     port = int(os.environ.get("PORT", 10000))
     config = uvicorn.Config(app, host="0.0.0.0", port=port)
     server = uvicorn.Server(config)
-    await server.serve()
+
+    asyncio.create_task(server.serve())
+
+    # ✅ ВАЖНО: polling запускаем последним
+    await application.run_polling()
 
 if __name__ == "__main__":
     asyncio.run(main())
