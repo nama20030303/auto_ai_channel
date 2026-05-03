@@ -2,29 +2,44 @@ import asyncio
 import os
 import re
 import requests
+import feedparser
 from bs4 import BeautifulSoup
 from openai import AsyncOpenAI
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import aiosqlite
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 import uvicorn
-from telegram import Update, Bot
-from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
+from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder,
+    MessageHandler,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
 
-# ================== ПЕРЕМЕННЫЕ ==================
+# ================== CONFIG ==================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
-POST_INTERVAL = 30  # минут
+POST_TIMES = ["12:00", "18:00"]
+
+PUBMED_RSS = "https://pubmed.ncbi.nlm.nih.gov/rss/search/1R5oYJkXyZgKkZsXx0H8/?limit=15&utm_campaign=pubmed-2&fc=20240101000000"
 
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 bot = Bot(token=BOT_TOKEN)
 app = FastAPI()
 DB = "posts.db"
 
-# ================== БАЗА ==================
+preview_storage = {}
+
+DISCLAIMER = "\n\n⚠️ Материал носит информационный характер. Возможны риски."
+
+# ================== DATABASE ==================
 
 async def init_db():
     async with aiosqlite.connect(DB) as db:
@@ -39,100 +54,148 @@ async def init_db():
 
 async def add_url(url):
     async with aiosqlite.connect(DB) as db:
-        await db.execute(
-            "INSERT INTO queue (url) VALUES (?)",
-            (url,)
-        )
+        await db.execute("INSERT INTO queue (url) VALUES (?)", (url,))
         await db.commit()
 
 async def get_next_url():
     async with aiosqlite.connect(DB) as db:
-        async with db.execute(
-            "SELECT id, url FROM queue WHERE published=0 LIMIT 1"
-        ) as cursor:
-            row = await cursor.fetchone()
+        async with db.execute("SELECT id, url FROM queue WHERE published=0 LIMIT 1") as cur:
+            row = await cur.fetchone()
             if row:
-                await db.execute(
-                    "UPDATE queue SET published=1 WHERE id=?",
-                    (row[0],)
-                )
+                await db.execute("UPDATE queue SET published=1 WHERE id=?", (row[0],))
                 await db.commit()
             return row
 
-# ================== ПАРСИНГ ==================
+async def count_queue():
+    async with aiosqlite.connect(DB) as db:
+        async with db.execute("SELECT COUNT(*) FROM queue WHERE published=0") as cur:
+            row = await cur.fetchone()
+            return row[0]
+
+# ================== PARSING ==================
 
 def parse_article(url):
     try:
         r = requests.get(url, timeout=10)
         soup = BeautifulSoup(r.text, "html.parser")
-
         text = "\n".join([p.get_text() for p in soup.find_all("p")])
-        img = soup.find("img")
-        image = img["src"] if img and img.get("src") else None
-
-        return text[:6000], image
+        return text[:6000]
     except:
-        return None, None
+        return None
 
-# ================== ИИ ==================
+def get_pubmed_article():
+    feed = feedparser.parse(PUBMED_RSS)
+    if not feed.entries:
+        return None
+    return feed.entries[0].link
+
+# ================== AI ==================
 
 async def generate_post(text):
     prompt = f"""
-    Сделай короткий интересный Telegram-пост.
-    До 1200 символов.
-    Добавь эмодзи.
-    В конце задай вопрос.
+Ты экспертный анонимный канал о спортивных добавках.
 
-    Текст:
-    {text}
-    """
+Сделай научный разбор:
+- что изучали
+- результаты с цифрами
+- вывод
 
+Добавь 3-5 релевантных хештегов в конце.
+Без медицинских обещаний.
+
+Текст:
+{text}
+"""
     response = await client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.7
+        temperature=0.7,
     )
 
-    return response.choices[0].message.content
+    content = response.choices[0].message.content
+    return content + DISCLAIMER
 
-# ================== ПУБЛИКАЦИЯ ==================
+# ================== PUBLISH ==================
 
-async def publish():
-    row = await get_next_url()
-    if not row:
-        return
-
-    _, url = row
-    text, image = parse_article(url)
-
+async def publish_from_url(url):
+    text = parse_article(url)
     if not text:
         return
 
     post = await generate_post(text)
+    await bot.send_message(CHANNEL_ID, post)
 
-    try:
-        if image:
-            await bot.send_photo(chat_id=CHANNEL_ID, photo=image, caption=post)
-        else:
-            await bot.send_message(chat_id=CHANNEL_ID, text=post)
-    except Exception as e:
-        print("Ошибка публикации:", e)
+async def auto_publish():
+    row = await get_next_url()
+    if row:
+        _, url = row
+        await publish_from_url(url)
+    else:
+        url = get_pubmed_article()
+        if url:
+            await publish_from_url(url)
 
-# ================== TELEGRAM ОБРАБОТКА ==================
+# ================== TELEGRAM ==================
 
+def admin_only(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user.id != ADMIN_ID:
+            return
+        return await func(update, context)
+    return wrapper
+
+@admin_only
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-
-    urls = re.findall(r'(https?://\S+)', text)
-
+    urls = re.findall(r'(https?://\S+)', update.message.text)
     if not urls:
-        await update.message.reply_text("Пришли ссылку на статью.")
+        await update.message.reply_text("Пришли ссылку.")
         return
 
-    for url in urls:
-        await add_url(url)
+    url = urls[0]
+    text = parse_article(url)
+    if not text:
+        await update.message.reply_text("Не удалось прочитать статью.")
+        return
 
-    await update.message.reply_text(f"✅ Добавлено ссылок: {len(urls)}")
+    post = await generate_post(text)
+
+    preview_storage[ADMIN_ID] = {"url": url, "post": post}
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Опубликовать", callback_data="approve"),
+            InlineKeyboardButton("📥 В очередь", callback_data="queue"),
+        ]
+    ])
+
+    await update.message.reply_text(post, reply_markup=keyboard)
+
+@admin_only
+async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    count = await count_queue()
+    await update.message.reply_text(f"📦 В очереди: {count}")
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.from_user.id != ADMIN_ID:
+        return
+
+    data = preview_storage.get(ADMIN_ID)
+    if not data:
+        await query.edit_message_text("Нет активного предпросмотра.")
+        return
+
+    if query.data == "approve":
+        await bot.send_message(CHANNEL_ID, data["post"])
+        preview_storage.pop(ADMIN_ID)
+        await query.edit_message_text("✅ Опубликовано")
+
+    elif query.data == "queue":
+        await add_url(data["url"])
+        preview_storage.pop(ADMIN_ID)
+        await query.edit_message_text("📥 Добавлено в очередь")
 
 # ================== FASTAPI ==================
 
@@ -140,18 +203,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def home():
     return {"status": "Bot running ✅"}
 
-# ================== ЗАПУСК ==================
+# ================== START ==================
 
 async def start_scheduler():
     await init_db()
-
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(publish, "interval", minutes=POST_INTERVAL)
+
+    for time_str in POST_TIMES:
+        hour, minute = map(int, time_str.split(":"))
+        scheduler.add_job(auto_publish, "cron", hour=hour, minute=minute)
+
     scheduler.start()
 
 async def start_telegram():
     application = ApplicationBuilder().token(BOT_TOKEN).build()
+
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(CommandHandler("queue", queue_command))
+    application.add_handler(CallbackQueryHandler(button_handler))
+
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
