@@ -1,9 +1,7 @@
 import os
 import re
-import base64
 import requests
 from bs4 import BeautifulSoup
-from openai import AsyncOpenAI
 from fastapi import FastAPI, Request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -19,12 +17,12 @@ import uvicorn
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
-WEBHOOK_URL = "https://auto-ai-channel.onrender.com/webhook"
+YANDEX_IAM_TOKEN = os.getenv("YANDEX_IAM_TOKEN")
+YANDEX_FOLDER_ID = os.getenv("YANDEX_FOLDER_ID")
 
-client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+WEBHOOK_URL = "https://auto-ai-channel.onrender.com/webhook"
 
 app = FastAPI()
 telegram_app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -37,81 +35,78 @@ DISCLAIMER = "\n\n⚠️ Материал носит информационны�
 def parse_article(url):
     try:
         headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0 Safari/537.36"
-            )
+            "User-Agent": "Mozilla/5.0"
         }
-
         r = requests.get(url, headers=headers, timeout=15)
         r.raise_for_status()
 
         soup = BeautifulSoup(r.text, "html.parser")
-
-        # 1️⃣ Обычные параграфы
         paragraphs = soup.find_all("p")
+
         text = "\n".join(
             p.get_text().strip()
             for p in paragraphs
             if len(p.get_text().strip()) > 40
         )
 
-        # 2️⃣ PubMed abstract
-        if len(text) < 200:
-            abstract = soup.find("div", class_="abstract-content")
-            if abstract:
-                text = abstract.get_text(separator="\n").strip()
-
-        # 3️⃣ Если мало текста — берём весь текст страницы
         if len(text) < 200:
             text = soup.get_text(separator="\n")
 
-        text = text.strip()
-
         if len(text) < 200:
-            print("PARSE ERROR: Still not enough content")
             return None
 
-        return text[:5000]
+        return text[:4000]
 
     except Exception as e:
         print("PARSE ERROR:", e)
         return None
 
-# ================= AI =================
+# ================= YANDEX GPT =================
 
-async def generate_post(text):
+def generate_post(text):
+    url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
+
+    headers = {
+        "Authorization": f"Bearer {YANDEX_IAM_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
     prompt = f"""
 Ты анонимный экспертный канал о спортивных добавках.
 
 Сделай научный разбор:
 - что изучали
-- результаты с цифрами
+- результаты
 - вывод
 
-Добавь 3-5 релевантных хештегов в конце.
-Без медицинских обещаний.
+Добавь 3-5 хештегов.
 
 Текст:
 {text}
 """
 
-    response = await client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.7,
-    )
+    data = {
+        "modelUri": f"gpt://{YANDEX_FOLDER_ID}/yandexgpt-lite/latest",
+        "completionOptions": {
+            "stream": False,
+            "temperature": 0.7,
+            "maxTokens": 1500
+        },
+        "messages": [
+            {"role": "user", "text": prompt}
+        ]
+    }
 
-    return response.choices[0].message.content + DISCLAIMER
+    try:
+        response = requests.post(url, headers=headers, json=data)
+        response.raise_for_status()
 
-async def generate_cover(title):
-    img = await client.images.generate(
-        model="gpt-image-1",
-        prompt=f"Minimalistic scientific fitness cover about {title}",
-        size="1024x1024"
-    )
-    return base64.b64decode(img.data[0].b64_json)
+        result = response.json()
+        return result["result"]["alternatives"][0]["message"]["text"] + DISCLAIMER
+
+    except Exception as e:
+        print("YANDEX ERROR:", e)
+        return "❌ Ошибка генерации текста. Проверь IAM токен."
 
 # ================= TELEGRAM =================
 
@@ -126,14 +121,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Ссылка не найдена.")
         return
 
-    await update.message.reply_text("⏳ Генерирую пост...")
+    await update.message.reply_text("⏳ Генерирую пост через YandexGPT...")
 
     article_text = parse_article(urls[0])
     if not article_text:
         await update.message.reply_text("❌ Не удалось прочитать статью.")
         return
 
-    post = await generate_post(article_text)
+    post = generate_post(article_text)
+
     preview_storage[ADMIN_ID] = {"post": post}
 
     keyboard = InlineKeyboardMarkup([
@@ -150,12 +146,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not data:
         return
 
-    cover = await generate_cover(data["post"][:80])
-
-    await context.bot.send_photo(
+    await context.bot.send_message(
         chat_id=CHANNEL_ID,
-        photo=cover,
-        caption=data["post"]
+        text=data["post"]
     )
 
     preview_storage.pop(ADMIN_ID)
@@ -181,14 +174,10 @@ async def webhook(req: Request):
 async def health():
     return {"status": "running"}
 
-# ================= STARTUP =================
-
 @app.on_event("startup")
 async def startup():
     await telegram_app.initialize()
     await telegram_app.bot.set_webhook(WEBHOOK_URL)
-
-# ================= MAIN =================
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
